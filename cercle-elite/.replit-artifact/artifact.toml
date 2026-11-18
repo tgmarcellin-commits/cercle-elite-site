@@ -1,0 +1,28 @@
+kind = "web"
+previewPath = "/"
+title = "Cercle Élite"
+description = "Application mobile-first de rencontre haut de gamme avec inscription guidée, profils par niveaux d'abonnement et parcours de découverte."
+version = "1.0.0"
+id = "artifacts/cercle-elite"
+router = "path"
+
+[[services]]
+name = "web"
+paths = [ "/" ]
+localPort = 25814
+
+[services.development]
+run = "pnpm --filter @workspace/cercle-elite run dev"
+
+[services.production]
+build = [ "pnpm", "--filter", "@workspace/cercle-elite", "run", "build" ]
+serve = "static"
+publicDir = "artifacts/cercle-elite/dist/public"
+
+[[services.production.rewrites]]
+from = "/*"
+to = "/index.html"
+
+[services.env]
+PORT = "25814"
+BASE_PATH = "/"
