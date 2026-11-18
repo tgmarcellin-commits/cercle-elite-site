@@ -13,6 +13,18 @@ const pool = new Pool({
   ssl: { rejectUnauthorized: false }
 });
 
+// Route d'accueil pour éviter l'erreur "Cannot GET /"
+app.get('/', (req, res) => {
+  res.json({
+    status: 'success',
+    message: 'Bienvenue sur l’API de Cercle-Elite 🚀',
+    endpoints: {
+      health: '/api/health',
+      members: '/api/members'
+    }
+  });
+});
+
 // Route de test de santé et de connexion DB
 app.get('/api/health', async (req, res) => {
   try {
