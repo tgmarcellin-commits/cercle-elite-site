@@ -28,6 +28,21 @@ app.get('/api/health', async (req, res) => {
   }
 });
 
+// Route pour récupérer la liste des membres depuis PostgreSQL
+app.get('/api/members', async (req, res) => {
+  try {
+    const result = await pool.query('SELECT * FROM members ORDER BY created_at DESC');
+    res.json({
+      success: true,
+      count: result.rows.length,
+      members: result.rows
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Erreur lors de la récupération des membres' });
+  }
+});
+
 const PORT = process.env.PORT || 5000;
 app.listen(PORT, () => {
   console.log(`Serveur back-end démarré sur le port ${PORT}`);
