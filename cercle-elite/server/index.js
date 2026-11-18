@@ -13,17 +13,8 @@ const pool = new Pool({
   ssl: { rejectUnauthorized: false }
 });
 
-// Route d'accueil pour éviter l'erreur "Cannot GET /"
-app.get('/', (req, res) => {
-  res.json({
-    status: 'success',
-    message: 'Bienvenue sur l’API de Cercle-Elite 🚀',
-    endpoints: {
-      health: '/api/health',
-      members: '/api/members'
-    }
-  });
-});
+// NOTE : La route d'accueil '/' a été retirée d'ici pour laisser 
+// la place à l'application React (frontend) sur Vercel.
 
 // Route de test de santé et de connexion DB
 app.get('/api/health', async (req, res) => {
@@ -56,6 +47,11 @@ app.get('/api/members', async (req, res) => {
 });
 
 const PORT = process.env.PORT || 5000;
-app.listen(PORT, () => {
-  console.log(`Serveur back-end démarré sur le port ${PORT}`);
-});
+if (process.env.NODE_ENV !== 'production') {
+  app.listen(PORT, () => {
+    console.log(`Serveur back-end démarré sur le port ${PORT}`);
+  });
+}
+
+// Indispensable pour que Vercel exécute Express en mode serverless
+module.exports = app;
