@@ -1,0 +1,629 @@
+import { useEffect, useMemo, useState, type ChangeEvent, type FormEvent } from 'react';
+import { Check, ChevronRight, LockKeyhole, Moon, ShieldCheck, Sparkles, Sun, X } from 'lucide-react';
+
+type TierId = 'standard' | 'confirme' | 'vip' | 'elite';
+type Profile = {
+  id: string;
+  name: string;
+  age: number;
+  city: string;
+  gender: 'Homme' | 'Femme';
+  sought: 'Homme' | 'Femme';
+  tier: TierId;
+  photo: string;
+  bio: string;
+  isMember?: boolean;
+};
+type Member = { id: string; email: string; pseudonym: string; gender: 'Homme' | 'Femme'; sought: 'Homme' | 'Femme'; city: string; photo: string; bio: string; tier: TierId };
+type Tier = { id: TierId; name: string; audience: string; price: number; note: string };
+
+const tiers: Tier[] = [
+  { id: 'standard', name: 'Standard', audience: 'Découverte', price: 7500, note: 'Une première rencontre avec le cercle.' },
+  { id: 'confirme', name: 'Confirmé', audience: 'Professionnels', price: 15000, note: 'Des parcours établis, des intentions claires.' },
+  { id: 'vip', name: 'VIP', audience: 'Cadres & Entrepreneurs', price: 25000, note: 'Des profils sélectionnés avec soin.' },
+  { id: 'elite', name: 'Élite', audience: 'Prestige', price: 40000, note: 'Le cercle le plus confidentiel.' },
+];
+
+const FALLBACK_PHOTO = 'https://images.unsplash.com/photo-1534528741775-53994a69daeb?auto=format&fit=crop&w=600&q=80';
+// Convertit une ligne de la base (API) en profil affichable
+const mapMember = (m: any): Profile => ({
+  id: String(m.id),
+  name: m.name || m.pseudonym || 'Membre',
+  age: m.age || 30,
+  city: m.city || 'Lomé',
+  gender: m.gender || 'Femme',
+  sought: m.sought || 'Homme',
+  tier: m.tier || 'standard',
+  photo: m.photo || FALLBACK_PHOTO,
+  bio: m.bio || 'Membre du Cercle Élite.',
+  isMember: true,
+});
+
+// Convertit la réponse de l'API (/auth, /members/:id) en membre connecté
+const toMember = (m: any): Member => ({
+  id: String(m.id),
+  email: m.email || '',
+  pseudonym: m.pseudonym || m.name || 'Membre',
+  gender: m.gender || 'Femme',
+  sought: m.sought || 'Homme',
+  city: m.city || '',
+  photo: m.photo || FALLBACK_PHOTO,
+  bio: m.bio || '',
+  tier: m.tier || 'standard',
+});
+
+class ApiError extends Error {
+  status: number;
+  code?: string;
+  constructor(message: string, status: number, code?: string) {
+    super(message);
+    this.status = status;
+    this.code = code;
+  }
+}
+// Appel JSON vers le back-end ; le jeton de session est envoyé en Bearer
+async function api(path: string, method = 'GET', body?: unknown, token?: string | null): Promise<any> {
+  const response = await fetch(path, {
+    method,
+    headers: { 'Content-Type': 'application/json', ...(token ? { Authorization: `Bearer ${token}` } : {}) },
+    body: body === undefined ? undefined : JSON.stringify(body),
+  });
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok || !data.success) {
+    throw new ApiError(data.error || 'Une erreur est survenue. Réessayez dans un instant.', response.status, data.code);
+  }
+  return data;
+}
+
+const starterProfiles: Profile[] = [
+  { id: 'a1', name: 'Amina', age: 31, city: 'Lomé', gender: 'Femme', sought: 'Homme', tier: 'standard', photo: 'https://images.unsplash.com/photo-1534528741775-53994a69daeb?auto=format&fit=crop&w=600&q=80', bio: 'Attachée aux conversations sincères et aux horizons ouverts.' },
+  { id: 'k1', name: 'Kwame', age: 35, city: 'Lomé', gender: 'Homme', sought: 'Femme', tier: 'standard', photo: 'https://images.unsplash.com/photo-1507003211169-0a1dd7228f2d?auto=format&fit=crop&w=600&q=80', bio: 'Entrepreneur, amateur de jazz et de belles idées.' },
+];
+
+function loadLocal<T>(key: string, fallback: T): T {
+  try {
+    const value = localStorage.getItem(key);
+    return value ? (JSON.parse(value) as T) : fallback;
+  } catch {
+    return fallback;
+  }
+}
+function saveLocal(key: string, value: unknown) {
+  try {
+    localStorage.setItem(key, JSON.stringify(value));
+  } catch {
+    // Fallback if storage fails
+  }
+}
+function removeLocal(key: string) {
+  try {
+    localStorage.removeItem(key);
+  } catch {
+    // Ignoré
+  }
+}
+function money(value: number) {
+  return new Intl.NumberFormat('fr-FR').format(value);
+}
+
+function App() {
+  const [theme, setTheme] = useState<'dark' | 'light'>(() => {
+    const savedTheme = loadLocal<'dark' | 'light'>('cercle-theme', 'dark');
+    return savedTheme === 'light' ? 'light' : 'dark';
+  });
+  const [token, setToken] = useState<string | null>(() => loadLocal<string | null>('cercle-token', null));
+  const [member, setMember] = useState<Member | null>(() => {
+    const saved = loadLocal<Member | null>('cercle-member', null);
+    return loadLocal<string | null>('cercle-token', null) && saved?.id ? saved : null;
+  });
+  const [profiles, setProfiles] = useState<Profile[]>(starterProfiles);
+  const [unlocked, setUnlocked] = useState<TierId[]>(() => loadLocal<TierId[]>('cercle-unlocked', []));
+  const [matches, setMatches] = useState<string[]>(() => loadLocal<string[]>('cercle-matches', []));
+  const [tierId, setTierId] = useState<TierId>('standard');
+  const [modal, setModal] = useState<'register' | 'login' | 'profile' | 'unlock' | null>(null);
+  const [registerStep, setRegisterStep] = useState(1);
+  const [email, setEmail] = useState('');
+  const [code, setCode] = useState('');
+  const [password, setPassword] = useState('');
+  const [registrationToken, setRegistrationToken] = useState('');
+  const [registerTier, setRegisterTier] = useState<TierId>('standard');
+  const [loginStep, setLoginStep] = useState<'credentials' | 'otp'>('credentials');
+  const [noAccount, setNoAccount] = useState(false);
+  const [info, setInfo] = useState('');
+  const [editPseudonym, setEditPseudonym] = useState('');
+  const [editBio, setEditBio] = useState('');
+  const [editPhoto, setEditPhoto] = useState('');
+  const [pseudonym, setPseudonym] = useState('');
+  const [gender, setGender] = useState<'Homme' | 'Femme'>('Femme');
+  const [sought, setSought] = useState<'Homme' | 'Femme'>('Homme');
+  const [city, setCity] = useState('Lomé');
+  const [bio, setBio] = useState('');
+  const [photo, setPhoto] = useState('');
+  const [error, setError] = useState('');
+  const [pendingTier, setPendingTier] = useState<TierId>('standard');
+  const [paymentDone, setPaymentDone] = useState(false);
+  const [loadingMembers, setLoadingMembers] = useState(true);
+  const [saving, setSaving] = useState(false);
+  
+  const activeTier = tiers.find((tier) => tier.id === tierId) ?? tiers[0];
+  const selectedTier = tiers.find((tier) => tier.id === pendingTier) ?? tiers[0];
+  const visibleProfiles = useMemo(() => profiles.filter((profile) => profile.tier === tierId), [profiles, tierId]);
+
+  // Chargement dynamique des membres depuis l'API Neon / Vercel
+  useEffect(() => {
+    let cancelled = false;
+    fetch('/api/members')
+      .then((res) => {
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        return res.json();
+      })
+      .then((data) => {
+        // Base vide : on garde les profils de démonstration
+        if (!cancelled && data.success && Array.isArray(data.members) && data.members.length > 0) {
+          setProfiles(data.members.map(mapMember));
+        }
+      })
+      .catch((err) => console.error('Erreur lors du chargement des membres :', err))
+      .finally(() => { if (!cancelled) setLoadingMembers(false); });
+    return () => { cancelled = true; };
+  }, []);
+
+  useEffect(() => {
+    document.documentElement.dataset.theme = theme;
+    document.documentElement.style.colorScheme = theme;
+    saveLocal('cercle-theme', theme);
+  }, [theme]);
+  useEffect(() => { if (member) saveLocal('cercle-member', member); else removeLocal('cercle-member'); }, [member]);
+  useEffect(() => { if (token) saveLocal('cercle-token', token); else removeLocal('cercle-token'); }, [token]);
+  useEffect(() => saveLocal('cercle-unlocked', unlocked), [unlocked]);
+  useEffect(() => saveLocal('cercle-matches', matches), [matches]);
+
+  const validEmail = (value: string) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value.trim());
+  const errorMessage = (err: unknown) => err instanceof Error ? err.message : 'Erreur réseau. Vérifiez votre connexion.';
+  const resetAuthForm = () => {
+    setPassword('');
+    setCode('');
+    setInfo('');
+    setError('');
+    setNoAccount(false);
+    setRegistrationToken('');
+  };
+
+  // --- Session ---------------------------------------------------------
+  const startSession = (newToken: string, m: Member) => {
+    setToken(newToken);
+    setMember(m);
+    setUnlocked((current) => current.includes(m.tier) ? current : [...current, m.tier]);
+    setTierId(m.tier);
+  };
+  const logout = () => {
+    setToken(null);
+    setMember(null);
+    setUnlocked([]);
+    setMatches([]);
+    resetAuthForm();
+    setModal(null);
+  };
+  // Au chargement : on vérifie que la session enregistrée est toujours valide
+  useEffect(() => {
+    if (!token) return;
+    api('/api/auth/me', 'GET', undefined, token)
+      .then((data) => setMember(toMember(data.member)))
+      .catch((err) => { if (err instanceof ApiError && err.status === 401) logout(); });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // --- Ouverture des fenêtres -------------------------------------------
+  const openRegister = () => {
+    resetAuthForm();
+    setRegisterStep(1);
+    setModal('register');
+  };
+  const openLogin = () => {
+    resetAuthForm();
+    setLoginStep('credentials');
+    setModal('login');
+  };
+  const openProfile = () => {
+    if (!member) return;
+    setError('');
+    setEditPseudonym(member.pseudonym);
+    setEditBio(member.bio);
+    setEditPhoto(member.photo);
+    setModal('profile');
+  };
+  const requestUnlock = (id: TierId) => {
+    setPendingTier(id);
+    setPaymentDone(false);
+    setModal('unlock');
+  };
+
+  // --- Inscription : étape 1 (e-mail + mot de passe → code OTP) ---------
+  const requestRegisterCode = async (goNext: boolean) => {
+    setSaving(true);
+    setError('');
+    try {
+      await api('/api/auth/request-otp', 'POST', { email: email.trim() });
+      setCode('');
+      setInfo(goNext ? `Un code à six chiffres a été envoyé à ${email.trim()}.` : 'Un nouveau code vient d’être envoyé.');
+      if (goNext) setRegisterStep(2);
+    } catch (err) {
+      setError(errorMessage(err));
+    } finally {
+      setSaving(false);
+    }
+  };
+  const sendRegisterCode = (event: FormEvent) => {
+    event.preventDefault();
+    if (saving) return;
+    if (!validEmail(email)) {
+      setError('Saisissez une adresse e-mail valide pour continuer.');
+      return;
+    }
+    if (password.length < 8) {
+      setError('Le mot de passe doit contenir au moins 8 caractères.');
+      return;
+    }
+    void requestRegisterCode(true);
+  };
+  // --- Inscription : étape 2 (code OTP) ---------------------------------
+  const verifyRegisterCode = async (event: FormEvent) => {
+    event.preventDefault();
+    if (saving) return;
+    if (!/^\d{6}$/.test(code.trim())) {
+      setError('Saisissez le code à six chiffres reçu par e-mail.');
+      return;
+    }
+    setSaving(true);
+    setError('');
+    try {
+      const data = await api('/api/auth/verify-otp', 'POST', { email: email.trim(), code: code.trim(), purpose: 'register' });
+      setRegistrationToken(data.registrationToken);
+      setInfo('');
+      setRegisterStep(3);
+    } catch (err) {
+      setError(errorMessage(err));
+    } finally {
+      setSaving(false);
+    }
+  };
+  const photoSelected = (event: ChangeEvent<HTMLInputElement>, setter: (value: string) => void = setPhoto) => {
+    const file = event.target.files?.[0];
+    if (!file) return;
+    if (!file.type.startsWith('image/')) {
+      setError('Choisissez un fichier image.');
+      return;
+    }
+    if (file.size > 1800000) {
+      setError('La photo doit faire moins de 1,8 Mo.');
+      return;
+    }
+    const reader = new FileReader();
+    reader.onload = () => setter(String(reader.result ?? ''));
+    reader.onerror = () => setError('La photo n’a pas pu être lue.');
+    reader.readAsDataURL(file);
+  };
+  // --- Inscription : étape 3 (profil + niveau) → création du compte -----
+  const saveProfile = async (event: FormEvent) => {
+    event.preventDefault();
+    if (saving) return;
+    if (pseudonym.trim().length < 2) {
+      setError('Choisissez un pseudonyme de deux caractères minimum.');
+      return;
+    }
+    if (city.trim().length < 2) {
+      setError('Indiquez votre ville, par exemple Lomé ou Aného.');
+      return;
+    }
+    if (!photo) {
+      setError('Ajoutez une photo de profil pour terminer votre inscription.');
+      return;
+    }
+    setSaving(true);
+    setError('');
+    try {
+      const data = await api('/api/auth/register', 'POST', {
+        registrationToken,
+        password,
+        pseudonym: pseudonym.trim(),
+        gender,
+        sought,
+        city: city.trim(),
+        bio: bio.trim(),
+        photo,
+        tier: registerTier,
+      });
+      const created = toMember(data.member);
+      startSession(data.token, created);
+      setProfiles((current) => [mapMember(data.member), ...current.filter((p) => p.id !== created.id)]);
+      setPseudonym('');
+      setBio('');
+      setPhoto('');
+      resetAuthForm();
+      setModal(null);
+    } catch (err) {
+      setError(errorMessage(err));
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  // --- Connexion : e-mail + mot de passe, puis code OTP -----------------
+  const submitLogin = async (event: FormEvent) => {
+    event.preventDefault();
+    if (saving) return;
+    if (!validEmail(email) || !password) {
+      setError('Saisissez votre e-mail et votre mot de passe.');
+      return;
+    }
+    setSaving(true);
+    setError('');
+    setNoAccount(false);
+    try {
+      await api('/api/auth/login', 'POST', { email: email.trim(), password });
+      setCode('');
+      setInfo(`Un code à six chiffres a été envoyé à ${email.trim()}.`);
+      setLoginStep('otp');
+    } catch (err) {
+      if (err instanceof ApiError && err.code === 'OTP_COOLDOWN') {
+        // Un code vient d'être envoyé : on laisse saisir celui déjà reçu
+        setInfo('Un code vous a déjà été envoyé il y a un instant. Saisissez-le ci-dessous.');
+        setLoginStep('otp');
+      } else {
+        if (err instanceof ApiError && err.code === 'NO_ACCOUNT') setNoAccount(true);
+        setError(errorMessage(err));
+      }
+    } finally {
+      setSaving(false);
+    }
+  };
+  const submitLoginOtp = async (event: FormEvent) => {
+    event.preventDefault();
+    if (saving) return;
+    if (!/^\d{6}$/.test(code.trim())) {
+      setError('Saisissez le code à six chiffres reçu par e-mail.');
+      return;
+    }
+    setSaving(true);
+    setError('');
+    try {
+      const data = await api('/api/auth/verify-otp', 'POST', { email: email.trim(), code: code.trim(), purpose: 'login' });
+      startSession(data.token, toMember(data.member));
+      resetAuthForm();
+      setModal(null);
+    } catch (err) {
+      setError(errorMessage(err));
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  // --- Modification du profil -------------------------------------------
+  const saveProfileEdit = async (event: FormEvent) => {
+    event.preventDefault();
+    if (saving || !member) return;
+    if (editPseudonym.trim().length < 2) {
+      setError('Choisissez un pseudonyme de deux caractères minimum.');
+      return;
+    }
+    setSaving(true);
+    setError('');
+    try {
+      const data = await api(`/api/members/${member.id}`, 'PUT', { pseudonym: editPseudonym.trim(), bio: editBio.trim(), photo: editPhoto }, token);
+      const updated = toMember(data.member);
+      setMember(updated);
+      setProfiles((current) => current.map((p) => p.id === updated.id ? mapMember(data.member) : p));
+      setModal(null);
+    } catch (err) {
+      if (err instanceof ApiError && err.status === 401) {
+        logout();
+        setModal('login');
+        setLoginStep('credentials');
+        setError('Votre session a expiré. Reconnectez-vous.');
+      } else {
+        setError(errorMessage(err));
+      }
+    } finally {
+      setSaving(false);
+    }
+  };
+  const finishUnlock = () => {
+    setUnlocked((current) => current.includes(pendingTier) ? current : [...current, pendingTier]);
+    setPaymentDone(true);
+  };
+  const toggleMatch = (id: string) => {
+    if (!member) {
+      openRegister();
+      return;
+    }
+    setMatches((current) => current.includes(id) ? current : [...current, id]);
+  };
+
+  return (
+    <div className="app-shell">
+      <header className="topbar">
+        <a className="brand" href="#accueil" aria-label="Cercle Élite, accueil">
+          <span className="brand-mark">C</span><span className="brand-name">CERCLE ÉLITE<span className="brand-caption">Rencontres avec intention</span></span>
+        </a>
+        <nav className="top-actions" aria-label="Navigation principale">
+          <button
+            className="theme-toggle"
+            type="button"
+            onClick={() => setTheme((current) => current === 'dark' ? 'light' : 'dark')}
+            aria-label={`Thème actuel : ${theme === 'dark' ? 'sombre' : 'clair'}.`}
+            title={`Passer au mode ${theme === 'dark' ? 'clair' : 'sombre'}`}
+          >
+            {theme === 'dark' ? <Sun size={16} aria-hidden="true" /> : <Moon size={16} aria-hidden="true" />}
+            <span className="theme-toggle-label">{theme === 'dark' ? 'Clair' : 'Sombre'}</span>
+          </button>
+          <button className="text-button" onClick={() => document.getElementById('catalogue')?.scrollIntoView({ behavior: 'smooth' })}>Le catalogue</button>
+          {member ? <button type="button" className="member-badge" style={{ background: 'none', cursor: 'pointer' }} onClick={openProfile} title="Modifier mon profil">MEMBRE · {member.pseudonym.toUpperCase()}</button> : <button className="text-button" onClick={openLogin}>Connexion</button>}
+          {member ? <button className="gold-button" onClick={logout}>Se déconnecter</button> : <button className="gold-button" onClick={openRegister}>Créer mon profil</button>}
+        </nav>
+      </header>
+
+      <main id="accueil">
+        <section className="hero">
+          <div>
+            <div className="eyebrow">Afrique · Europe · Au-delà</div>
+            <h1>Les belles histoires<br />commencent <em>en cercle.</em></h1>
+            <p className="hero-copy">Un espace privé pour celles et ceux qui souhaitent construire une relation sincère. Découvrez des profils vérifiés, à votre rythme et selon vos affinités.</p>
+            <div className="hero-cta">
+              <button className="gold-button" onClick={() => member ? document.getElementById('catalogue')?.scrollIntoView({ behavior: 'smooth' }) : openRegister()}>{member ? 'Découvrir le cercle' : 'Rejoindre le cercle'} <ChevronRight size={15} style={{ verticalAlign: 'middle', marginLeft: 7 }} /></button>
+              <button className="outline-button" onClick={() => document.getElementById('catalogue')?.scrollIntoView({ behavior: 'smooth' })}>Explorer les profils</button>
+            </div>
+          </div>
+          <aside className="hero-aside" aria-label="Le cercle en chiffres">
+            <div className="ornament" aria-hidden="true" />
+            <div><div className="aside-number">{profiles.length.toString().padStart(2, '0')}</div><div className="aside-label">profils dans le cercle aujourd’hui</div></div>
+            <div><div className="eyebrow">Un espace choisi</div><p className="aside-label">Des échanges respectueux, des intentions assumées.</p></div>
+          </aside>
+        </section>
+
+        <section className="section" id="catalogue">
+          <div className="section-heading">
+            <div><div className="eyebrow">Le catalogue privé</div><h2>Une rencontre à votre mesure.</h2></div>
+            <p>Choisissez le niveau qui vous ressemble. Les portraits se dévoilent au sein d’un cercle pensé pour la confiance.</p>
+          </div>
+          <div className="tier-tabs" role="tablist" aria-label="Niveaux de membres">
+            {tiers.map((tier) => {
+              const count = profiles.filter((profile) => profile.tier === tier.id).length;
+              return <button key={tier.id} role="tab" aria-selected={tierId === tier.id} className={`tier-tab ${tierId === tier.id ? 'active' : ''}`} onClick={() => setTierId(tier.id)}>
+                {tier.name}<span>{count.toString().padStart(2, '0')}</span>{unlocked.includes(tier.id) && <span aria-label="Débloqué">✓</span>}
+              </button>;
+            })}
+          </div>
+          <div className="catalogue-bar">
+            <div><strong>{activeTier.name}</strong><small> · {activeTier.audience}</small></div>
+            <small>{visibleProfiles.length} {visibleProfiles.length > 1 ? 'profils' : 'profil'} dans ce niveau</small>
+          </div>
+          <div className="profile-grid">
+            {loadingMembers ? <p role="status" aria-live="polite">Chargement des profils…</p> : visibleProfiles.length ? visibleProfiles.map((profile) => {
+              const locked = !unlocked.includes(profile.tier);
+              const requested = matches.includes(profile.id);
+              return <article className={`profile-card ${locked ? 'locked' : ''}`} key={profile.id}>
+                <div className="profile-photo-wrap">
+                  <img className="profile-photo" src={profile.photo} alt={locked ? 'Portrait confidentiel' : `Portrait de ${profile.name}`} />
+                  <span className="verified"><ShieldCheck size={11} style={{ verticalAlign: 'middle', marginRight: 4 }} /> Vérifié</span>
+                  {locked && <div className="lock-overlay"><span className="lock-glyph"><LockKeyhole size={17} /></span><span>PORTRAIT CONFIDENTIEL</span></div>}
+                </div>
+                <div className="profile-info">
+                  <div className="profile-name">{locked ? 'Profil privé' : profile.name}<span>{profile.age} ans</span></div>
+                  <div className="profile-meta">{profile.city} · {profile.gender}</div>
+                  <div className="profile-bio">{locked ? 'Débloquez ce niveau pour découvrir ce profil et ses intentions.' : profile.bio}</div>
+                  {locked
+                    ? <button className="gold-button locked-action" onClick={() => requestUnlock(profile.tier)}>Débloquer ce niveau via CinetPay</button>
+                    : <button className={`match-button ${requested ? 'sent' : ''}`} onClick={() => toggleMatch(profile.id)} disabled={requested}>{requested ? 'Demande envoyée' : 'Proposer une rencontre'}</button>}
+                </div>
+              </article>;
+            }) : <div className="empty-card"><strong>Le cercle s’agrandit.</strong>Il n’y a pas encore de profil dans ce niveau. Revenez bientôt ou créez le vôtre.</div>}
+          </div>
+        </section>
+      </main>
+      <footer className="footer"><span>CERCLE ÉLITE · LOMÉ, TOGO</span><span>Application en ligne · 2026</span></footer>
+
+      {modal === 'register' && <div className="modal-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) setModal(null); }}>
+        <section className="modal" role="dialog" aria-modal="true" aria-labelledby="register-title">
+          <button className="modal-close" onClick={() => setModal(null)} aria-label="Fermer"><X size={18} /></button>
+          <div className="modal-kicker">Votre espace, en trois étapes</div>
+          <h2 id="register-title">{registerStep === 1 ? 'Commençons par vous.' : registerStep === 2 ? 'Vérifions votre e-mail.' : 'Votre profil prend forme.'}</h2>
+          <div className="stepper" aria-label={`Étape ${registerStep} sur 3`}>{[1, 2, 3].map((step) => <span key={step} className={`step-dot ${registerStep >= step ? 'active' : ''}`} />)}</div>
+          {registerStep === 1 && <form onSubmit={sendRegisterCode} noValidate>
+            <p className="modal-subtitle">Créez votre accès. Nous vous envoyons un code de vérification par e-mail.</p>
+            <div className="form-field"><label htmlFor="email">Adresse e-mail</label><input id="email" type="email" autoComplete="email" placeholder="vous@exemple.com" value={email} onChange={(event) => setEmail(event.target.value)} required /></div>
+            <div className="form-field"><label htmlFor="password">Mot de passe</label><input id="password" type="password" autoComplete="new-password" placeholder="8 caractères minimum" value={password} onChange={(event) => setPassword(event.target.value)} required /></div>
+            {error && <p className="form-error" role="alert">{error}</p>}
+            <div className="modal-actions"><button type="button" className="text-button" onClick={openLogin}>Déjà membre ? Se connecter</button><button className="gold-button" type="submit" disabled={saving}>{saving ? 'Envoi…' : 'Recevoir mon code'}</button></div>
+          </form>}
+          {registerStep === 2 && <form onSubmit={verifyRegisterCode} noValidate>
+            {info && <div className="payment-note">{info}</div>}
+            <div className="form-field"><label htmlFor="otp">Code à six chiffres</label><input id="otp" inputMode="numeric" autoComplete="one-time-code" maxLength={6} placeholder="000000" value={code} onChange={(event) => setCode(event.target.value.replace(/\D/g, ''))} required /></div>
+            <button type="button" className="text-button" onClick={() => void requestRegisterCode(false)} disabled={saving}>Renvoyer le code</button>
+            {error && <p className="form-error" role="alert">{error}</p>}
+            <div className="modal-actions"><button type="button" className="text-button" onClick={() => { setRegisterStep(1); setError(''); setInfo(''); }}>Retour</button><button className="gold-button" type="submit" disabled={saving}>{saving ? 'Vérification…' : 'Vérifier le code'}</button></div>
+          </form>}
+          {registerStep === 3 && <form onSubmit={saveProfile} noValidate>
+            <p className="modal-subtitle">Quelques détails pour proposer des rencontres qui vous ressemblent.</p>
+            <div className="form-field"><label htmlFor="pseudonym">Pseudonyme</label><input id="pseudonym" value={pseudonym} onChange={(event) => setPseudonym(event.target.value)} placeholder="Ex. Afi" required maxLength={28} /></div>
+            <div className="form-row">
+              <div className="form-field"><label htmlFor="gender">Je suis</label><select id="gender" value={gender} onChange={(event) => setGender(event.target.value as 'Homme' | 'Femme')}><option>Femme</option><option>Homme</option></select></div>
+              <div className="form-field"><label htmlFor="sought">Je recherche</label><select id="sought" value={sought} onChange={(event) => setSought(event.target.value as 'Homme' | 'Femme')}><option>Homme</option><option>Femme</option></select></div>
+            </div>
+            <div className="form-field"><label htmlFor="city">Ma ville</label><input id="city" list="city-options" value={city} onChange={(event) => setCity(event.target.value)} placeholder="Lomé ou Aného" required /><datalist id="city-options"><option value="Lomé" /><option value="Aného" /><option value="Kpalimé" /><option value="Accra" /></datalist></div>
+            <div className="form-field"><label htmlFor="tier">Mon niveau</label><select id="tier" value={registerTier} onChange={(event) => setRegisterTier(event.target.value as TierId)}>{tiers.map((tier) => <option key={tier.id} value={tier.id}>{tier.name} · {tier.audience} · {money(tier.price)} FCFA/mois</option>)}</select><small style={{ color: '#7f8a99' }}>{(tiers.find((tier) => tier.id === registerTier) ?? tiers[0]).note} Paiement simulé.</small></div>
+            <label className="photo-picker" htmlFor="profile-photo">
+              {photo ? <img className="photo-preview" src={photo} alt="Aperçu de votre photo" /> : <span className="photo-preview" aria-hidden="true" style={{ display: 'grid', placeItems: 'center', border: '1px solid #536074', color: '#d4af37' }}><Sparkles size={19} /></span>}
+              <span>{photo ? 'Changer la photo' : 'Ajouter une photo de profil'}<br /><small>JPG ou PNG · 1,8 Mo maximum</small></span>
+            </label>
+            <input id="profile-photo" className="visually-hidden" type="file" accept="image/*" onChange={(event) => photoSelected(event)} />
+            <div className="form-field"><label htmlFor="bio">Ce que vous souhaitez partager</label><textarea id="bio" value={bio} onChange={(event) => setBio(event.target.value)} placeholder="Vos centres d’intérêt..." maxLength={260} /><small style={{ color: '#7f8a99' }}>{bio.length}/260 caractères</small></div>
+            {error && <p className="form-error" role="alert">{error}</p>}
+            <div className="modal-actions"><span /><button className="gold-button" type="submit" disabled={saving}>{saving ? 'Création…' : 'Créer mon profil'}</button></div>
+          </form>}
+        </section>
+      </div>}
+
+      {modal === 'login' && <div className="modal-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) setModal(null); }}>
+        <section className="modal" role="dialog" aria-modal="true" aria-labelledby="login-title">
+          <button className="modal-close" onClick={() => setModal(null)} aria-label="Fermer"><X size={18} /></button>
+          <div className="modal-kicker">Espace membre</div>
+          <h2 id="login-title">{loginStep === 'credentials' ? 'Bon retour parmi nous.' : 'Dernière vérification.'}</h2>
+          {loginStep === 'credentials' && <form onSubmit={submitLogin} noValidate>
+            <p className="modal-subtitle">Connectez-vous avec votre e-mail et votre mot de passe. Un code de sécurité vous sera envoyé par e-mail.</p>
+            <div className="form-field"><label htmlFor="login-email">Adresse e-mail</label><input id="login-email" type="email" autoComplete="email" placeholder="vous@exemple.com" value={email} onChange={(event) => setEmail(event.target.value)} required /></div>
+            <div className="form-field"><label htmlFor="login-password">Mot de passe</label><input id="login-password" type="password" autoComplete="current-password" value={password} onChange={(event) => setPassword(event.target.value)} required /></div>
+            {error && <p className="form-error" role="alert">{error}</p>}
+            {noAccount && <div className="payment-note">Vous n’avez pas encore de compte ? <button type="button" className="text-button" onClick={openRegister}>Créer mon profil</button></div>}
+            <div className="modal-actions"><button type="button" className="text-button" onClick={openRegister}>Pas encore membre ?</button><button className="gold-button" type="submit" disabled={saving}>{saving ? 'Vérification…' : 'Se connecter'}</button></div>
+          </form>}
+          {loginStep === 'otp' && <form onSubmit={submitLoginOtp} noValidate>
+            {info && <div className="payment-note">{info}</div>}
+            <div className="form-field"><label htmlFor="login-otp">Code à six chiffres</label><input id="login-otp" inputMode="numeric" autoComplete="one-time-code" maxLength={6} placeholder="000000" value={code} onChange={(event) => setCode(event.target.value.replace(/\D/g, ''))} required /></div>
+            {error && <p className="form-error" role="alert">{error}</p>}
+            <div className="modal-actions"><button type="button" className="text-button" onClick={() => { setLoginStep('credentials'); setError(''); setInfo(''); }}>Retour</button><button className="gold-button" type="submit" disabled={saving}>{saving ? 'Vérification…' : 'Valider le code'}</button></div>
+          </form>}
+        </section>
+      </div>}
+
+      {modal === 'profile' && member && <div className="modal-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) setModal(null); }}>
+        <section className="modal" role="dialog" aria-modal="true" aria-labelledby="profile-title">
+          <button className="modal-close" onClick={() => setModal(null)} aria-label="Fermer"><X size={18} /></button>
+          <div className="modal-kicker">Mon espace</div>
+          <h2 id="profile-title">Modifier mon profil.</h2>
+          <form onSubmit={saveProfileEdit} noValidate>
+            <p className="modal-subtitle">{member.email} · niveau {(tiers.find((tier) => tier.id === member.tier) ?? tiers[0]).name}</p>
+            <label className="photo-picker" htmlFor="edit-photo">
+              {editPhoto ? <img className="photo-preview" src={editPhoto} alt="Aperçu de votre photo" /> : <span className="photo-preview" aria-hidden="true" style={{ display: 'grid', placeItems: 'center', border: '1px solid #536074', color: '#d4af37' }}><Sparkles size={19} /></span>}
+              <span>Changer la photo<br /><small>JPG ou PNG · 1,8 Mo maximum</small></span>
+            </label>
+            <input id="edit-photo" className="visually-hidden" type="file" accept="image/*" onChange={(event) => photoSelected(event, setEditPhoto)} />
+            <div className="form-field"><label htmlFor="edit-pseudonym">Pseudonyme</label><input id="edit-pseudonym" value={editPseudonym} onChange={(event) => setEditPseudonym(event.target.value)} required maxLength={28} /></div>
+            <div className="form-field"><label htmlFor="edit-bio">Ce que vous souhaitez partager</label><textarea id="edit-bio" value={editBio} onChange={(event) => setEditBio(event.target.value)} maxLength={260} /><small style={{ color: '#7f8a99' }}>{editBio.length}/260 caractères</small></div>
+            {error && <p className="form-error" role="alert">{error}</p>}
+            <div className="modal-actions"><button type="button" className="text-button" onClick={() => setModal(null)}>Annuler</button><button className="gold-button" type="submit" disabled={saving}>{saving ? 'Enregistrement…' : 'Enregistrer'}</button></div>
+          </form>
+        </section>
+      </div>}
+
+      {modal === 'unlock' && <div className="modal-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) setModal(null); }}>
+        <section className="modal" role="dialog" aria-modal="true" aria-labelledby="unlock-title">
+          <button className="modal-close" onClick={() => setModal(null)} aria-label="Fermer"><X size={18} /></button>
+          {paymentDone ? <>
+            <div className="success-mark"><Check size={25} /></div><div className="modal-kicker">Accès activé</div><h2 id="unlock-title">Le cercle s’ouvre à vous.</h2>
+            <p className="modal-subtitle">Le niveau {selectedTier.name} est maintenant débloqué sur cet appareil.</p>
+            <div className="payment-note">Simulation terminée : aucun paiement réel n’a été effectué.</div>
+            <div className="modal-actions"><span /><button className="gold-button" onClick={() => setModal(null)}>Découvrir les profils</button></div>
+          </> : <>
+            <div className="modal-kicker">Accès mensuel · simulation</div><h2 id="unlock-title">Débloquer {selectedTier.name}.</h2>
+            <p className="modal-subtitle">{selectedTier.note} Confirmez pour révéler les profils de ce niveau.</p>
+            <div className="price-line"><strong>{money(selectedTier.price)}</strong><span>FCFA / mois · prix illustratif</span></div>
+            <div className="payment-note">Cette démonstration reproduit un parcours CinetPay.</div>
+            <div className="modal-actions"><button className="text-button" onClick={() => setModal(null)}>Annuler</button><button className="gold-button" onClick={finishUnlock}>Confirmer l’accès simulé</button></div>
+          </>}
+        </section>
+      </div>}
+    </div>
+  );
+}
+
+export default App;
