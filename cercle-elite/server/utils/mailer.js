@@ -29,7 +29,7 @@ async function sendOtpEmail(to, code, purpose) {
 if (!isMailConfigured()) {
 // En local uniquement : le code s'affiche dans la console du serveur.
 if (process.env.NODE_ENV !== 'production') {
-console.log([DEV] Code OTP (${purpose}) pour ${to} : ${code});
+console.log(`[DEV] Code OTP (${purpose}) pour ${to} : ${code}`);
 return;
 }
 const err = new Error('SMTP non configuré (SMTP_HOST, SMTP_USER, SMTP_PASS).');
