@@ -1035,7 +1035,7 @@ function App() {
           </div>
         </section>
       </main>
-      <footer className="footer"><span>CERCLE ÉLITE · LOMÉ, TOGO</span><span>Application en ligne · 2026 · <button type="button" className="link-button" onClick={() => setLegalDoc('cgu')}>{lang === 'fr' ? 'CGU' : 'Terms'}</button> · <button type="button" className="link-button" onClick={() => setLegalDoc('privacy')}>{lang === 'fr' ? 'Confidentialité' : 'Privacy'}</button></span></footer>
+      <footer className="footer"><span>CERCLE ÉLITE · AFRIQUE · EUROPE · AU-DELÀ</span><span>Application en ligne · 2026 · <button type="button" className="link-button" onClick={() => setLegalDoc('cgu')}>{lang === 'fr' ? 'CGU' : 'Terms'}</button> · <button type="button" className="link-button" onClick={() => setLegalDoc('privacy')}>{lang === 'fr' ? 'Confidentialité' : 'Privacy'}</button></span></footer>
 
       {modal === 'register' && <div className="modal-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) setModal(null); }}>
         <section className="modal" role="dialog" aria-modal="true" aria-labelledby="register-title">
