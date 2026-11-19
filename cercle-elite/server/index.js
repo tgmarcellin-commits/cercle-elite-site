@@ -1,0 +1,717 @@
+const express = require('express');
+const cors = require('cors');
+const { Pool } = require('pg');
+const bcrypt = require('bcryptjs');
+const jwt = require('jsonwebtoken');
+require('dotenv').config();
+
+const {
+  OTP_TTL_MINUTES,
+  OTP_MAX_ATTEMPTS,
+  OTP_RESEND_COOLDOWN_SEC,
+  getSecret,
+  generateOtp,
+  hashOtp,
+  safeEqual,
+} = require('./utils/otp');
+const { sendOtpEmail } = require('./utils/mailer');
+
+const app = express();
+app.use(cors());
+app.use(express.json({ limit: '4mb' })); // photo en base64 (≈ 2,4 Mo max)
+
+// Connexion à la base de données PostgreSQL (compatible Neon.tech)
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: { rejectUnauthorized: false }
+});
+
+// ---------------------------------------------------------------------------
+// Constantes & utilitaires
+// ---------------------------------------------------------------------------
+const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+const GENDERS = ['Homme', 'Femme'];
+const TIERS = ['standard', 'confirme', 'vip', 'elite']; // mêmes identifiants que le front
+const SESSION_TTL = '7d';
+
+// Colonnes renvoyées au client (jamais password_hash)
+const MEMBER_COLUMNS = 'id, email, pseudonym, name, age, birth_date, gender, sought, city, bio, photo, tier, created_at, terms_accepted_at';
+
+class HttpError extends Error {
+  constructor(status, message, code, extra) {
+    super(message);
+    this.status = status;
+    this.code = code;
+    this.extra = extra || {};
+  }
+}
+
+function calculateAge(birthDateStr) {
+  if (!birthDateStr) return null;
+  const dob = new Date(birthDateStr);
+  if (Number.isNaN(dob.getTime())) return null;
+  const now = new Date();
+  let age = now.getUTCFullYear() - dob.getUTCFullYear();
+  const monthDiff = now.getUTCMonth() - dob.getUTCMonth();
+  if (monthDiff < 0 || (monthDiff === 0 && now.getUTCDate() < dob.getUTCDate())) {
+    age--;
+  }
+  return age;
+}
+
+function toMember(row) {
+  const pseudonym = row.pseudonym || row.name;
+  const birthDate = row.birth_date ? new Date(row.birth_date).toISOString().slice(0, 10) : '';
+  const computedAge = birthDate ? calculateAge(birthDate) : row.age;
+  return {
+    id: String(row.id),
+    email: row.email,
+    pseudonym,
+    name: pseudonym,
+    age: computedAge ?? 30,
+    birth_date: birthDate,
+    gender: row.gender,
+    sought: row.sought,
+    city: row.city,
+    bio: row.bio || '',
+    photo: row.photo,
+    tier: row.tier,
+    created_at: row.created_at,
+    termsAcceptedAt: row.terms_accepted_at || null,
+  };
+}
+
+// Valideurs de champs de profil
+const fieldValidators = {
+  pseudonym: (v) => {
+    const s = String(v).trim();
+    if (s.length < 2 || s.length > 40) throw new HttpError(400, 'Le pseudonyme doit faire entre 2 et 40 caractères.');
+    return s;
+  },
+  birth_date: (v) => {
+    const s = String(v).trim();
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(s)) throw new HttpError(400, 'Format de date de naissance invalide (AAAA-MM-JJ).');
+    const age = calculateAge(s);
+    if (age === null || age > 110) throw new HttpError(400, 'Date de naissance invalide.');
+    if (age < 18) throw new HttpError(400, 'Vous devez avoir au moins 18 ans pour rejoindre Cercle Élite.');
+    return s;
+  },
+  gender: (v) => {
+    if (!GENDERS.includes(v)) throw new HttpError(400, 'Genre invalide.');
+    return v;
+  },
+  sought: (v) => {
+    if (!GENDERS.includes(v)) throw new HttpError(400, 'Recherche invalide.');
+    return v;
+  },
+  city: (v) => {
+    const s = String(v).trim();
+    if (s.length < 2 || s.length > 60) throw new HttpError(400, 'Ville invalide.');
+    return s;
+  },
+  bio: (v) => {
+    const s = String(v).trim();
+    if (s.length > 260) throw new HttpError(400, 'La bio ne doit pas dépasser 260 caractères.');
+    return s;
+  },
+  photo: (v) => {
+    const s = String(v);
+    if (!/^data:image\/(png|jpe?g|webp|gif);base64,/.test(s) || s.length > 3000000) {
+      throw new HttpError(400, 'Photo invalide ou trop volumineuse.');
+    }
+    return s;
+  },
+  tier: (v) => {
+    if (!TIERS.includes(v)) throw new HttpError(400, 'Niveau invalide.');
+    return v;
+  },
+};
+
+// Lit et valide les champs de profil. Champ absent => null (ou erreur si requis).
+function readProfileFields(body, required) {
+  const out = {};
+  for (const field of Object.keys(fieldValidators)) {
+    const raw = field === 'pseudonym' ? (body.pseudonym ?? body.name) : body[field];
+    if (raw === undefined || raw === null || raw === '') {
+      if (required.includes(field)) throw new HttpError(400, `Champ requis : ${field}.`);
+      out[field] = null;
+    } else {
+      out[field] = fieldValidators[field](raw);
+    }
+  }
+  return out;
+}
+
+function validateEmail(value) {
+  const email = String(value ?? '').trim().toLowerCase();
+  if (!EMAIL_RE.test(email) || email.length > 254) throw new HttpError(400, 'Adresse e-mail invalide.');
+  return email;
+}
+
+function validatePassword(value) {
+  const password = String(value ?? '');
+  if (password.length < 8) throw new HttpError(400, 'Le mot de passe doit contenir au moins 8 caractères.');
+  if (Buffer.byteLength(password) > 72) throw new HttpError(400, 'Le mot de passe est trop long (72 octets maximum).');
+  return password;
+}
+
+const signSession = (memberRow) =>
+  jwt.sign({ sub: String(memberRow.id) }, getSecret(), { expiresIn: SESSION_TTL });
+
+// Middleware : exige un jeton de session valide (Authorization: Bearer …)
+function authRequired(req, res, next) {
+  const header = req.headers.authorization || '';
+  const token = header.startsWith('Bearer ') ? header.slice(7) : null;
+  if (!token) {
+    return res.status(401).json({ success: false, error: 'Authentification requise.', code: 'UNAUTHENTICATED' });
+  }
+  const secret = getSecret();
+  try {
+    const payload = jwt.verify(token, secret);
+    if (payload.purpose) throw new Error('Jeton non valable pour une session.');
+    req.auth = payload;
+    next();
+  } catch {
+    res.status(401).json({ success: false, error: 'Session expirée. Reconnectez-vous.', code: 'SESSION_EXPIRED' });
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Schéma de la base (idempotent, exécuté une fois par instance serverless)
+// ---------------------------------------------------------------------------
+let schemaReady = null;
+function ensureSchema() {
+  if (!schemaReady) {
+    schemaReady = (async () => {
+      await pool.query(`
+        CREATE TABLE IF NOT EXISTS members (
+          id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+          email         TEXT,
+          password_hash TEXT,
+          pseudonym     TEXT,
+          name          TEXT,
+          age           INTEGER,
+          birth_date    DATE,
+          gender        TEXT,
+          sought        TEXT,
+          city          TEXT,
+          bio           TEXT,
+          photo         TEXT,
+          tier          TEXT NOT NULL DEFAULT 'standard',
+          created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )`);
+      // Table déjà existante : on complète les colonnes manquantes et harmonise les types en TEXT
+      for (const col of ['email', 'password_hash', 'pseudonym', 'name', 'gender', 'sought', 'city', 'bio', 'photo']) {
+        await pool.query(`ALTER TABLE members ADD COLUMN IF NOT EXISTS ${col} TEXT`);
+        try {
+          await pool.query(`ALTER TABLE members ALTER COLUMN ${col} TYPE TEXT`);
+        } catch (e) { /* ignoré si déjà TEXT */ }
+      }
+      await pool.query(`ALTER TABLE members ADD COLUMN IF NOT EXISTS age INTEGER`);
+      await pool.query(`ALTER TABLE members ADD COLUMN IF NOT EXISTS birth_date DATE`);
+      await pool.query(`ALTER TABLE members ADD COLUMN IF NOT EXISTS terms_accepted_at TIMESTAMPTZ`);
+      await pool.query(`ALTER TABLE members ADD COLUMN IF NOT EXISTS tier TEXT NOT NULL DEFAULT 'standard'`);
+      try {
+        await pool.query(`ALTER TABLE members ALTER COLUMN tier TYPE TEXT`);
+      } catch (e) { /* ignoré */ }
+      await pool.query(`ALTER TABLE members ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()`);
+      try { await pool.query(`ALTER TABLE members ALTER COLUMN name DROP NOT NULL`); } catch (e) { /* ignoré */ }
+      // Anciens membres : le pseudonyme reprend l'ancien champ « name »
+      await pool.query(`UPDATE members SET pseudonym = name WHERE pseudonym IS NULL AND name IS NOT NULL`);
+      // Un e-mail = un compte (sans échec si d'anciens doublons existent)
+      try {
+        await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS members_email_unique ON members (LOWER(email))`);
+      } catch (e) {
+        console.warn('Index unique e-mail non créé :', e.message);
+      }
+      await pool.query(`
+        CREATE TABLE IF NOT EXISTS otp_codes (
+          email      TEXT NOT NULL,
+          purpose    TEXT NOT NULL,
+          code_hash  TEXT NOT NULL,
+          attempts   INTEGER NOT NULL DEFAULT 0,
+          expires_at TIMESTAMPTZ NOT NULL,
+          created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+          PRIMARY KEY (email, purpose)
+        )`);
+      // Messagerie : messages (texte, photo, audio, vidéo) et quota des membres « standard »
+      await pool.query(`
+        CREATE TABLE IF NOT EXISTS messages (
+          id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+          sender_id    TEXT NOT NULL,
+          recipient_id TEXT NOT NULL,
+          kind         TEXT NOT NULL,
+          body         TEXT,
+          media        TEXT,
+          duration_ms  INTEGER,
+          reply_to     UUID,
+          created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )`);
+      await pool.query(`CREATE INDEX IF NOT EXISTS messages_created_idx ON messages (created_at)`);
+      await pool.query(`CREATE INDEX IF NOT EXISTS messages_pair_idx ON messages (sender_id, recipient_id, created_at)`);
+      await pool.query(`
+        CREATE TABLE IF NOT EXISTS chat_quota (
+          member_id     TEXT PRIMARY KEY,
+          sent          INTEGER NOT NULL DEFAULT 0,
+          blocked_until TIMESTAMPTZ
+        )`);
+    })().catch((err) => { schemaReady = null; throw err; });
+  }
+  return schemaReady;
+}
+
+// Enveloppe les routes : schéma prêt + gestion uniforme des erreurs
+const route = (handler) => async (req, res, next) => {
+  try {
+    await ensureSchema();
+    await handler(req, res, next);
+  } catch (err) {
+    if (err instanceof HttpError) {
+      return res.status(err.status).json({ success: false, error: err.message, code: err.code, ...err.extra });
+    }
+    if (err && err.code === '23505') {
+      return res.status(409).json({ success: false, error: 'Cet e-mail est déjà inscrit.', code: 'EMAIL_EXISTS' });
+    }
+    if (err && err.code === 'MAIL_NOT_CONFIGURED') {
+      console.error(err.message);
+      return res.status(503).json({ success: false, error: "L'envoi d'e-mails n'est pas encore configuré sur le serveur.", code: 'MAIL_NOT_CONFIGURED' });
+    }
+    console.error(err);
+    res.status(500).json({ success: false, error: 'Erreur interne du serveur.' });
+  }
+};
+
+// ---------------------------------------------------------------------------
+// OTP : émission et vérification (stockés en base : compatible serverless)
+// ---------------------------------------------------------------------------
+async function issueOtp(email, purpose) {
+  const existing = await pool.query('SELECT created_at FROM otp_codes WHERE email = $1 AND purpose = $2', [email, purpose]);
+  if (existing.rows[0]) {
+    const ageSec = (Date.now() - new Date(existing.rows[0].created_at).getTime()) / 1000;
+    if (ageSec < OTP_RESEND_COOLDOWN_SEC) {
+      throw new HttpError(429, 'Un code vient d’être envoyé. Patientez une minute avant d’en demander un nouveau.', 'OTP_COOLDOWN');
+    }
+  }
+  const code = generateOtp();
+  await pool.query(
+    `INSERT INTO otp_codes (email, purpose, code_hash, attempts, expires_at, created_at)
+     VALUES ($1::text, $2::text, $3::text, 0, NOW() + make_interval(mins => $4::int), NOW())
+     ON CONFLICT (email, purpose) DO UPDATE
+       SET code_hash = EXCLUDED.code_hash, attempts = 0,
+           expires_at = EXCLUDED.expires_at, created_at = NOW()`,
+    [email, purpose, hashOtp(email, purpose, code), OTP_TTL_MINUTES]
+  );
+  try {
+    await sendOtpEmail(email, code, purpose);
+  } catch (err) {
+    await pool.query('DELETE FROM otp_codes WHERE email = $1 AND purpose = $2', [email, purpose]);
+    throw err;
+  }
+}
+
+async function checkOtp(email, purpose, code) {
+  const result = await pool.query(
+    'SELECT code_hash, attempts, expires_at FROM otp_codes WHERE email = $1 AND purpose = $2',
+    [email, purpose]
+  );
+  const row = result.rows[0];
+  if (!row || new Date(row.expires_at) < new Date()) {
+    throw new HttpError(400, 'Code expiré ou introuvable. Demandez un nouveau code.', 'OTP_EXPIRED');
+  }
+  if (row.attempts >= OTP_MAX_ATTEMPTS) {
+    throw new HttpError(429, 'Trop de tentatives. Demandez un nouveau code.', 'OTP_LOCKED');
+  }
+  if (!/^\d{6}$/.test(code) || !safeEqual(hashOtp(email, purpose, code), row.code_hash)) {
+    await pool.query('UPDATE otp_codes SET attempts = attempts + 1 WHERE email = $1 AND purpose = $2', [email, purpose]);
+    throw new HttpError(400, 'Code incorrect.', 'OTP_INVALID');
+  }
+  await pool.query('DELETE FROM otp_codes WHERE email = $1 AND purpose = $2', [email, purpose]); // usage unique
+}
+
+// ---------------------------------------------------------------------------
+// Routes
+// ---------------------------------------------------------------------------
+
+// Route de test de santé et de connexion DB
+app.get('/api/health', async (req, res) => {
+  try {
+    const result = await pool.query('SELECT NOW()');
+    res.json({
+      status: 'success',
+      message: 'Serveur et base de données connectés avec succès !',
+      databaseTime: result.rows[0].now
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Erreur de connexion à la base de données PostgreSQL' });
+  }
+});
+
+// Liste publique des membres (sans e-mail ni mot de passe)
+app.get('/api/members', route(async (req, res) => {
+  const result = await pool.query(
+    `SELECT id, COALESCE(pseudonym, name) AS name,
+            COALESCE(EXTRACT(YEAR FROM AGE(CURRENT_DATE, birth_date))::int, age, 30) AS age,
+            gender, sought, city, bio, photo, tier, created_at
+     FROM members ORDER BY created_at DESC`
+  );
+  res.json({ success: true, count: result.rows.length, members: result.rows });
+}));
+
+// INSCRIPTION — étape 1 : envoi du code OTP à l'e-mail
+app.post('/api/auth/request-otp', route(async (req, res) => {
+  const email = validateEmail(req.body.email);
+  const exists = await pool.query('SELECT 1 FROM members WHERE LOWER(email) = $1', [email]);
+  if (exists.rows.length) {
+    throw new HttpError(409, 'Cet e-mail est déjà inscrit. Connectez-vous.', 'EMAIL_EXISTS');
+  }
+  await issueOtp(email, 'register');
+  res.json({ success: true });
+}));
+
+// INSCRIPTION — étape 3 : création du compte (e-mail déjà prouvé par l'OTP)
+app.post('/api/auth/register', route(async (req, res) => {
+  const body = req.body || {};
+  let email;
+  try {
+    const payload = jwt.verify(String(body.registrationToken || ''), getSecret());
+    if (payload.purpose !== 'register' || !payload.email) throw new Error('mauvais jeton');
+    email = payload.email;
+  } catch {
+    throw new HttpError(401, 'Vérification e-mail expirée. Recommencez l’inscription.', 'REGISTRATION_EXPIRED');
+  }
+
+  if (body.ageConfirmed !== true || body.acceptedTerms !== true) {
+    throw new HttpError(400, 'Vous devez certifier avoir 18 ans révolus et accepter les CGU et la Politique de confidentialité.', 'TERMS_REQUIRED');
+  }
+  const password = validatePassword(body.password);
+  const f = readProfileFields(body, ['pseudonym', 'birth_date', 'gender', 'sought', 'city', 'photo', 'tier']);
+  const computedAge = calculateAge(f.birth_date);
+
+  const exists = await pool.query('SELECT 1 FROM members WHERE LOWER(email) = $1', [email]);
+  if (exists.rows.length) throw new HttpError(409, 'Cet e-mail est déjà inscrit.', 'EMAIL_EXISTS');
+
+  const passwordHash = await bcrypt.hash(password, 10);
+  // TODO paiement : vérifier le paiement (CinetPay) avant d'accepter un niveau payant.
+  const result = await pool.query(
+    `INSERT INTO members (email, password_hash, pseudonym, name, age, birth_date, gender, sought, city, bio, photo, tier, terms_accepted_at)
+     VALUES ($1::text, $2::text, $3::text, $3::text, $4::int, $5::date, $6::text, $7::text, $8::text, $9::text, $10::text, $11::text, NOW())
+     RETURNING ${MEMBER_COLUMNS}`,
+    [email, passwordHash, f.pseudonym, computedAge, f.birth_date, f.gender, f.sought, f.city, f.bio ?? '', f.photo, f.tier]
+  );
+  const row = result.rows[0];
+  res.status(201).json({ success: true, token: signSession(row), member: toMember(row) });
+}));
+
+// CONNEXION — étape 1 : e-mail + mot de passe, puis envoi du code OTP
+app.post('/api/auth/login', route(async (req, res) => {
+  const email = validateEmail(req.body.email);
+  const password = String(req.body.password ?? '');
+  const result = await pool.query('SELECT id, password_hash FROM members WHERE LOWER(email) = $1', [email]);
+  const row = result.rows[0];
+  if (!row) throw new HttpError(404, 'Aucun compte ne correspond à cet e-mail.', 'NO_ACCOUNT');
+  if (!row.password_hash) {
+    throw new HttpError(401, 'Ce compte n’a pas de mot de passe. Créez votre profil à nouveau.', 'NO_PASSWORD');
+  }
+  if (!password || !(await bcrypt.compare(password, row.password_hash))) {
+    throw new HttpError(401, 'E-mail ou mot de passe incorrect.', 'INVALID_CREDENTIALS');
+  }
+  await issueOtp(email, 'login');
+  res.json({ success: true, otpRequired: true });
+}));
+
+// Vérification du code OTP (inscription ou connexion)
+app.post('/api/auth/verify-otp', route(async (req, res) => {
+  const email = validateEmail(req.body.email);
+  const code = String(req.body.code ?? '').trim();
+  const purpose = req.body.purpose;
+
+  if (purpose === 'register') {
+    await checkOtp(email, 'register', code);
+    const registrationToken = jwt.sign({ email, purpose: 'register' }, getSecret(), { expiresIn: '30m' });
+    return res.json({ success: true, registrationToken });
+  }
+  if (purpose === 'login') {
+    await checkOtp(email, 'login', code);
+    const result = await pool.query(`SELECT ${MEMBER_COLUMNS} FROM members WHERE LOWER(email) = $1`, [email]);
+    const row = result.rows[0];
+    if (!row) throw new HttpError(404, 'Aucun compte ne correspond à cet e-mail.', 'NO_ACCOUNT');
+    return res.json({ success: true, token: signSession(row), member: toMember(row) });
+  }
+  throw new HttpError(400, 'Type de vérification invalide.');
+}));
+
+// Session courante (restauration au chargement de la page)
+app.get('/api/auth/me', authRequired, route(async (req, res) => {
+  const result = await pool.query(`SELECT ${MEMBER_COLUMNS} FROM members WHERE id::text = $1`, [req.auth.sub]);
+  if (!result.rows[0]) throw new HttpError(401, 'Compte introuvable.', 'SESSION_EXPIRED');
+  res.json({ success: true, member: toMember(result.rows[0]) });
+}));
+
+// Mise à jour du profil — uniquement par le propriétaire du compte
+app.put('/api/members/:id', authRequired, route(async (req, res) => {
+  if (String(req.auth.sub) !== String(req.params.id)) {
+    throw new HttpError(403, 'Vous ne pouvez modifier que votre propre profil.', 'FORBIDDEN');
+  }
+  const f = readProfileFields(req.body || {}, []); // champs absents => inchangés
+  const computedAge = f.birth_date ? calculateAge(f.birth_date) : null;
+  // TODO paiement : vérifier le paiement avant d'accepter un changement vers un niveau payant.
+  const result = await pool.query(
+    `UPDATE members SET
+       pseudonym  = COALESCE($1::text, pseudonym),
+       name       = COALESCE($1::text, name),
+       birth_date = COALESCE($2::date, birth_date),
+       age        = COALESCE($3::int, age),
+       gender     = COALESCE($4::text, gender),
+       sought     = COALESCE($5::text, sought),
+       city       = COALESCE($6::text, city),
+       bio        = COALESCE($7::text, bio),
+       photo      = COALESCE($8::text, photo),
+       tier       = COALESCE($9::text, tier)
+     WHERE id::text = $10::text
+     RETURNING ${MEMBER_COLUMNS}`,
+    [f.pseudonym, f.birth_date, computedAge, f.gender, f.sought, f.city, f.bio, f.photo, f.tier, req.params.id]
+  );
+  if (!result.rows[0]) throw new HttpError(404, 'Membre introuvable.');
+  res.json({ success: true, member: toMember(result.rows[0]) });
+}));
+
+// ---------------------------------------------------------------------------
+// Messagerie privée (texte, photos, audio 15 s, vidéo 5 s)
+// ---------------------------------------------------------------------------
+const MSG_TTL_HOURS = 72;          // suppression automatique des messages
+const STANDARD_MSG_LIMIT = 5;      // quota du niveau « standard »
+const STANDARD_BLOCK_HOURS = 5;    // attente avant réinitialisation du quota
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const BASE64_TAIL = /^[A-Za-z0-9+/]+={0,2}$/;
+const MEDIA_RULES = {
+  photo: { prefix: /^data:image\/(png|jpe?g|webp|gif);base64,/, maxChars: 3000000 },
+  audio: { prefix: /^data:audio\/[a-z0-9.+-]+;base64,/i, maxChars: 1000000, maxMs: 15000 },
+  video: { prefix: /^data:video\/[a-z0-9.+-]+;base64,/i, maxChars: 3200000, maxMs: 5000 },
+};
+
+// Supprime définitivement les messages de plus de 72 h (au plus 1 fois / minute / instance)
+let lastPurge = 0;
+async function purgeExpired(force = false) {
+  if (!force && Date.now() - lastPurge < 60 * 1000) return 0;
+  lastPurge = Date.now();
+  const result = await pool.query(
+    'DELETE FROM messages WHERE created_at < NOW() - make_interval(hours => $1::int)',
+    [MSG_TTL_HOURS]
+  );
+  await pool.query('DELETE FROM otp_codes WHERE expires_at < NOW()');
+  return result.rowCount;
+}
+const safePurge = () => purgeExpired().catch((e) => console.error('Purge des messages :', e.message));
+
+async function readQuota(memberId, tier) {
+  if (tier !== 'standard') return { limited: false, limit: null, remaining: null, blockedUntil: null };
+  const result = await pool.query('SELECT sent, blocked_until FROM chat_quota WHERE member_id = $1', [memberId]);
+  const row = result.rows[0];
+  const until = row && row.blocked_until ? new Date(row.blocked_until) : null;
+  const blocked = until && until > new Date() ? until : null;
+  const sent = row && !(until && !blocked) ? row.sent : 0; // délai écoulé => quota remis à zéro
+  return {
+    limited: true,
+    limit: STANDARD_MSG_LIMIT,
+    remaining: blocked ? 0 : Math.max(0, STANDARD_MSG_LIMIT - sent),
+    blockedUntil: blocked ? blocked.toISOString() : null,
+  };
+}
+
+async function getMemberTier(memberId) {
+  const result = await pool.query('SELECT tier FROM members WHERE id::text = $1', [memberId]);
+  return result.rows[0] ? result.rows[0].tier : null;
+}
+
+const MESSAGE_SELECT = `
+  SELECT m.id, m.sender_id, m.kind, m.body, m.media, m.duration_ms, m.reply_to, m.created_at,
+         r.kind AS reply_kind, LEFT(r.body, 140) AS reply_body, r.sender_id AS reply_sender
+  FROM messages m LEFT JOIN messages r ON r.id = m.reply_to`;
+
+function toMessage(row, me) {
+  let reply = null;
+  if (row.reply_to) {
+    reply = row.reply_kind
+      ? { id: String(row.reply_to), kind: row.reply_kind, body: row.reply_body || '', fromMe: row.reply_sender === me }
+      : { id: String(row.reply_to), kind: 'text', body: 'Message supprimé', fromMe: false, deleted: true };
+  }
+  return {
+    id: String(row.id),
+    fromMe: row.sender_id === me,
+    kind: row.kind,
+    body: row.body || '',
+    media: row.media || null,
+    durationMs: row.duration_ms,
+    createdAt: row.created_at,
+    reply,
+  };
+}
+
+function validateMessage(body) {
+  const kind = String(body.kind || 'text');
+  if (!['text', 'photo', 'audio', 'video'].includes(kind)) throw new HttpError(400, 'Type de message invalide.');
+  const text = String(body.body ?? '').trim();
+  let media = null;
+  let durationMs = null;
+
+  if (kind === 'text') {
+    if (!text) throw new HttpError(400, 'Le message est vide.');
+    if (text.length > 1000) throw new HttpError(400, 'Message trop long (1000 caractères maximum).');
+  } else {
+    const rule = MEDIA_RULES[kind];
+    media = String(body.media ?? '');
+    const comma = media.indexOf(',');
+    if (!rule.prefix.test(media) || media.length > rule.maxChars || !BASE64_TAIL.test(media.slice(comma + 1))) {
+      throw new HttpError(400, kind === 'photo' ? 'Photo invalide ou trop volumineuse.' : 'Fichier multimédia invalide ou trop volumineux.');
+    }
+    if (kind !== 'photo') {
+      durationMs = Math.round(Number(body.durationMs));
+      if (!Number.isFinite(durationMs) || durationMs <= 0 || durationMs > rule.maxMs + 1000) {
+        throw new HttpError(400, kind === 'audio' ? 'L’audio ne doit pas dépasser 15 secondes.' : 'La vidéo ne doit pas dépasser 5 secondes.');
+      }
+    }
+    if (text.length > 500) throw new HttpError(400, 'Légende trop longue (500 caractères maximum).');
+  }
+  return { kind, text, media, durationMs };
+}
+
+// Quota restant du membre connecté
+app.get('/api/chat/quota', authRequired, route(async (req, res) => {
+  const tier = await getMemberTier(req.auth.sub);
+  if (!tier) throw new HttpError(401, 'Compte introuvable.', 'SESSION_EXPIRED');
+  res.json({ success: true, quota: await readQuota(req.auth.sub, tier) });
+}));
+
+// Liste des conversations (dernier message de chaque échange, 72 h max)
+app.get('/api/messages', authRequired, route(async (req, res) => {
+  await safePurge();
+  const me = String(req.auth.sub);
+  const result = await pool.query(
+    `SELECT DISTINCT ON (peer) peer, kind, body, from_me, created_at FROM (
+       SELECT CASE WHEN sender_id = $1 THEN recipient_id ELSE sender_id END AS peer,
+              kind, LEFT(body, 140) AS body, (sender_id = $1) AS from_me, created_at
+       FROM messages
+       WHERE (sender_id = $1 OR recipient_id = $1)
+         AND created_at > NOW() - make_interval(hours => $2::int)
+     ) t ORDER BY peer, created_at DESC`,
+    [me, MSG_TTL_HOURS]
+  );
+  const conversations = result.rows
+    .map((r) => ({ peerId: r.peer, kind: r.kind, body: r.body || '', fromMe: r.from_me, createdAt: r.created_at }))
+    .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+  const tier = await getMemberTier(me);
+  res.json({ success: true, conversations, quota: await readQuota(me, tier) });
+}));
+
+// Fil de discussion avec un membre (since = ne renvoyer que les nouveaux messages)
+app.get('/api/messages/:peerId', authRequired, route(async (req, res) => {
+  await safePurge();
+  const me = String(req.auth.sub);
+  const peer = String(req.params.peerId).slice(0, 64);
+  let since = null;
+  if (req.query.since) {
+    since = new Date(String(req.query.since));
+    if (Number.isNaN(since.getTime())) throw new HttpError(400, 'Paramètre since invalide.');
+  }
+  const result = await pool.query(
+    `${MESSAGE_SELECT}
+     WHERE ((m.sender_id = $1 AND m.recipient_id = $2) OR (m.sender_id = $2 AND m.recipient_id = $1))
+       AND m.created_at > NOW() - make_interval(hours => $3::int)
+       AND ($4::timestamptz IS NULL OR m.created_at > $4::timestamptz)
+     ORDER BY m.created_at DESC LIMIT 100`,
+    [me, peer, MSG_TTL_HOURS, since]
+  );
+  const tier = await getMemberTier(me);
+  res.json({
+    success: true,
+    messages: result.rows.reverse().map((row) => toMessage(row, me)),
+    quota: await readQuota(me, tier),
+  });
+}));
+
+// Envoi d'un message (quota appliqué côté serveur pour le niveau « standard »)
+app.post('/api/messages', authRequired, route(async (req, res) => {
+  await safePurge();
+  const me = String(req.auth.sub);
+  const body = req.body || {};
+  const to = String(body.to ?? '').slice(0, 64);
+  if (!to || to === me) throw new HttpError(400, 'Destinataire invalide.');
+  const { kind, text, media, durationMs } = validateMessage(body);
+
+  const peerExists = await pool.query('SELECT 1 FROM members WHERE id::text = $1', [to]);
+  if (!peerExists.rows.length) throw new HttpError(404, 'Ce membre est introuvable.');
+
+  let replyTo = null;
+  if (body.replyTo) {
+    replyTo = String(body.replyTo);
+    if (!UUID_RE.test(replyTo)) throw new HttpError(400, 'Message cité invalide.');
+    const target = await pool.query(
+      `SELECT 1 FROM messages WHERE id = $1
+         AND ((sender_id = $2 AND recipient_id = $3) OR (sender_id = $3 AND recipient_id = $2))`,
+      [replyTo, me, to]
+    );
+    if (!target.rows.length) throw new HttpError(400, 'Le message cité n’existe plus.');
+  }
+
+  const tier = await getMemberTier(me);
+  if (!tier) throw new HttpError(401, 'Compte introuvable.', 'SESSION_EXPIRED');
+
+  const client = await pool.connect();
+  let messageId;
+  try {
+    await client.query('BEGIN');
+    if (tier === 'standard') {
+      await client.query('INSERT INTO chat_quota (member_id) VALUES ($1) ON CONFLICT DO NOTHING', [me]);
+      const q = (await client.query('SELECT sent, blocked_until FROM chat_quota WHERE member_id = $1 FOR UPDATE', [me])).rows[0];
+      let sent = q.sent;
+      let blockedUntil = q.blocked_until ? new Date(q.blocked_until) : null;
+      if (blockedUntil && blockedUntil <= new Date()) { sent = 0; blockedUntil = null; } // réinitialisation auto
+      if (blockedUntil) {
+        throw new HttpError(
+          429,
+          `Vous avez atteint la limite de ${STANDARD_MSG_LIMIT} messages du niveau Standard.`,
+          'QUOTA_REACHED',
+          { blockedUntil: blockedUntil.toISOString() }
+        );
+      }
+      sent += 1;
+      if (sent >= STANDARD_MSG_LIMIT) blockedUntil = new Date(Date.now() + STANDARD_BLOCK_HOURS * 3600 * 1000);
+      await client.query('UPDATE chat_quota SET sent = $2, blocked_until = $3 WHERE member_id = $1', [me, sent, blockedUntil]);
+    }
+    const inserted = await client.query(
+      `INSERT INTO messages (sender_id, recipient_id, kind, body, media, duration_ms, reply_to)
+       VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id`,
+      [me, to, kind, text || null, media, durationMs, replyTo]
+    );
+    messageId = inserted.rows[0].id;
+    await client.query('COMMIT');
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
+    throw err;
+  } finally {
+    client.release();
+  }
+
+  const saved = await pool.query(`${MESSAGE_SELECT} WHERE m.id = $1`, [messageId]);
+  res.status(201).json({ success: true, message: toMessage(saved.rows[0], me), quota: await readQuota(me, tier) });
+}));
+
+// Purge planifiée (Vercel Cron, voir vercel.json) — protégée par CRON_SECRET
+app.get('/api/cron/purge', route(async (req, res) => {
+  const secret = process.env.CRON_SECRET;
+  if (!secret || req.headers.authorization !== `Bearer ${secret}`) {
+    throw new HttpError(401, 'Non autorisé.');
+  }
+  res.json({ success: true, deleted: await purgeExpired(true) });
+}));
+
+const PORT = process.env.PORT || 5000;
+if (process.env.NODE_ENV !== 'production') {
+  app.listen(PORT, () => {
+    console.log(`Serveur back-end démarré sur le port ${PORT}`);
+  });
+}
+
+// Indispensable pour que Vercel exécute Express en mode serverless
+module.exports = app;
