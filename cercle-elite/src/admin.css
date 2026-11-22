@@ -1,0 +1,61 @@
+/* Espace d'administration (/admin) — styles isolés par le préfixe .adm- */
+.adm-login, .adm-shell {
+  min-height: 100vh;
+  background: #0b0f17;
+  color: #e8ecf3;
+  font-family: 'DM Sans', system-ui, sans-serif;
+}
+.adm-login { display: grid; place-items: center; padding: 24px; }
+.adm-login-card { width: 100%; max-width: 380px; display: grid; gap: 12px; }
+.adm-shell h1, .adm-login h1, .adm-card h2 { font-family: 'Playfair Display', Georgia, serif; font-weight: 600; margin: 0; }
+.adm-shell h1, .adm-login h1 { font-size: 1.3rem; color: #d4af37; }
+.adm-card h2 { font-size: 1.05rem; margin-bottom: 8px; }
+
+.adm-header { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 14px 20px; border-bottom: 1px solid #1f2837; flex-wrap: wrap; }
+.adm-tabs { display: flex; gap: 6px; padding: 10px 20px 0; overflow-x: auto; }
+.adm-tab { background: transparent; color: #9aa5b5; border: 1px solid #1f2837; border-radius: 8px 8px 0 0; padding: 9px 14px; cursor: pointer; white-space: nowrap; font: inherit; font-size: 0.88rem; }
+.adm-tab.is-active { color: #0b0f17; background: #d4af37; border-color: #d4af37; font-weight: 600; }
+.adm-seg { display: flex; gap: 6px; margin: 8px 0 12px; flex-wrap: wrap; }
+.adm-seg .adm-tab { border-radius: 8px; }
+.adm-main { padding: 16px 20px 40px; display: grid; gap: 16px; max-width: 1200px; margin: 0 auto; }
+
+.adm-card { background: #121926; border: 1px solid #1f2837; border-radius: 12px; padding: 16px; }
+.adm-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(170px, 1fr)); gap: 12px; }
+.adm-stat { display: grid; gap: 4px; }
+.adm-stat strong { font-size: 1.6rem; color: #f2f4f8; }
+.adm-muted { color: #9aa5b5; }
+.adm-info { color: #7ddc9a; margin: 4px 0; }
+.adm-error { color: #ff8b8b; margin: 4px 0; }
+
+.adm-form { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 12px; align-items: end; }
+.adm-form > .adm-error, .adm-form > .adm-info, .adm-form > button { grid-column: 1 / -1; }
+.adm-field { display: grid; gap: 4px; }
+.adm-field label, .adm-login label { font-size: 0.8rem; color: #9aa5b5; }
+.adm-shell input, .adm-shell select, .adm-login input {
+  background: #0b0f17; color: #e8ecf3; border: 1px solid #2a3547; border-radius: 8px; padding: 9px 10px; font: inherit; font-size: 0.9rem; min-width: 0;
+}
+.adm-shell input:focus, .adm-shell select:focus, .adm-login input:focus { outline: 2px solid #d4af37; outline-offset: 1px; }
+.adm-filters { display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 12px; }
+.adm-filters input { flex: 1 1 240px; }
+
+.adm-btn { background: #1a2332; color: #e8ecf3; border: 1px solid #2a3547; border-radius: 8px; padding: 8px 12px; cursor: pointer; font: inherit; font-size: 0.82rem; }
+.adm-btn:hover:not(:disabled) { border-color: #d4af37; }
+.adm-btn:disabled { opacity: 0.45; cursor: not-allowed; }
+.adm-btn-gold { background: #d4af37; color: #0b0f17; border-color: #d4af37; font-weight: 600; }
+.adm-btn-danger { color: #ff8b8b; border-color: #5a2a2a; }
+
+.adm-scroll { overflow-x: auto; }
+.adm-table { width: 100%; border-collapse: collapse; font-size: 0.88rem; }
+.adm-table th { text-align: left; color: #9aa5b5; font-weight: 500; padding: 8px 10px; border-bottom: 1px solid #1f2837; white-space: nowrap; }
+.adm-table td { padding: 10px; border-bottom: 1px solid #1a2230; vertical-align: top; }
+.adm-table tr.is-suspended td { opacity: 0.6; }
+.adm-actions { display: flex; gap: 6px; flex-wrap: wrap; }
+.adm-badge { display: inline-block; background: rgba(212, 175, 55, 0.18); color: #d4af37; border: 1px solid #d4af37; border-radius: 999px; padding: 1px 8px; font-size: 0.7rem; vertical-align: middle; }
+.adm-badge-red { background: rgba(255, 139, 139, 0.12); color: #ff8b8b; border-color: #ff8b8b; }
+
+.adm-link { color: #d4af37; text-decoration: underline; }
+
+.adm-member { display: flex; gap: 12px; align-items: flex-start; }
+.adm-thumb { width: 48px; height: 48px; flex: 0 0 48px; border-radius: 10px; border: 1px solid #2a3547; object-fit: cover; background: #0b0f17; display: block; }
+.adm-thumb-fallback { display: grid; place-items: center; color: #d4af37; font-weight: 600; font-size: 1.1rem; }
+.adm-badge-muted { background: rgba(154, 165, 181, 0.12); color: #9aa5b5; border-color: #3a475c; }
